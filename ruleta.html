@@ -1,0 +1,438 @@
+<!DOCTYPE html>
+<html lang="es">
+
+<head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover" />
+    <title>QuickPlay — ¿Qué Jugar Hoy?</title>
+    <meta name="description" content="QuickPlay: Ruleta interactiva con realidad aumentada facial." />
+    <meta name="theme-color" content="#070709" />
+    <link rel="icon" type="image/png" href="assets/ui/logo.png" />
+    <link rel="stylesheet" href="css/app.css" />
+    <style>
+        #container {
+            position: fixed;
+            inset: 0;
+            width: 100vw;
+            height: 100vh;
+            overflow: hidden;
+            z-index: 1;
+        }
+
+        #container video {
+            position: fixed !important;
+            inset: 0 !important;
+            width: 100vw !important;
+            height: 100vh !important;
+            object-fit: cover !important;
+            z-index: 1 !important;
+        }
+
+        #container canvas {
+            position: fixed !important;
+            inset: 0 !important;
+            width: 100vw !important;
+            height: 100vh !important;
+            z-index: 2 !important;
+            pointer-events: none !important;
+        }
+    </style>
+    <script type="importmap">
+    {
+        "imports": {
+            "three": "https://cdn.jsdelivr.net/npm/three@0.160.0/build/three.module.js",
+            "three/addons/": "https://cdn.jsdelivr.net/npm/three@0.160.0/examples/jsm/",
+            "mindar-face-three": "https://cdn.jsdelivr.net/npm/mind-ar@1.2.5/dist/mindar-face-three.prod.js"
+        }
+    }
+    </script>
+</head>
+
+<body>
+
+    <!-- BOTÓN FLOTANTE VOLVER (LIQUID GLASS) -->
+    <a href="index.html" class="btn-back" id="btn-back-ruleta" aria-label="Volver al menú principal">⬅ VOLVER</a>
+
+    <!-- CONTENEDOR EN PANTALLA COMPLETA PARA CÁMARA FRONTAL Y THREE.JS -->
+    <div id="container"></div>
+
+    <!-- PANTALLA DE CARGA INICIAL -->
+    <div id="ruleta-loader" class="ruleta-placeholder">
+        <div class="ruleta-spinner" aria-hidden="true"></div>
+        <p class="ruleta-msg">Cargando experiencia de rostro...</p>
+    </div>
+
+    <!-- HINT SUTIL EN PANTALLA -->
+    <div id="ruleta-hint" style="display:none; position:fixed; bottom:28px; left:50%; transform:translateX(-50%); z-index:2500; background:rgba(7,7,9,0.75); border:1.5px solid #FFD21F; backdrop-filter:blur(8px); -webkit-backdrop-filter:blur(8px); padding:10px 24px; border-radius:30px; color:#ffffff; font-family:'Montserrat',sans-serif; font-size:13px; font-weight:700; letter-spacing:0.06em; text-transform:uppercase; pointer-events:none; text-align:center; box-shadow:0 4px 20px rgba(0,0,0,0.6), 0 0 12px rgba(255,210,31,0.25);">
+        ABRE LA BOCA O TOCA LA PANTALLA PARA GIRAR
+    </div>
+
+    <script type="module">
+        import * as THREE from 'three';
+        window.THREE = THREE;
+
+        import { APP } from './js/app.js';
+        import { MindARThree } from 'mindar-face-three';
+
+        /* ── DOM REFS ── */
+        const container = document.querySelector('#container');
+        const loader = document.querySelector('#ruleta-loader');
+        const hint = document.querySelector('#ruleta-hint');
+        const backBtn = document.querySelector('#btn-back-ruleta');
+
+        let player = null;
+        let mindarThree = null;
+        let header = null;
+        let ruleta = null;
+
+        /* ── PRECARGA EXPLÍCITA DE TEXTURAS DE RULETA (CON ESPACIO DE COLOR sRGB) ── */
+        const textureLoader = new THREE.TextureLoader();
+        const textureUrls = [
+            './assets/ruleta/cup.png',
+            './assets/ruleta/fc.png',
+            './assets/ruleta/gta.png',
+            './assets/ruleta/tlou.png'
+        ];
+
+        const textures = textureUrls.map(url => {
+            const tex = textureLoader.load(url);
+            if ('colorSpace' in tex) {
+                tex.colorSpace = THREE.SRGBColorSpace;
+            } else {
+                tex.encoding = THREE.sRGBEncoding;
+            }
+            tex.needsUpdate = true;
+            return tex;
+        });
+
+        /* ── PRECARGA DE AUDIOS ── */
+        const audioRuleta = new Audio('./assets/audio/ruleta.mp3');
+        const audioWin = new Audio('./assets/audio/win.mp3');
+        [audioRuleta, audioWin].forEach(a => {
+            a.load();
+            a.volume = 1;
+        });
+
+        /* ── DESBLOQUEO GLOBAL DE AUDIO (iOS / Android / Vercel Autoplay Policy) ── */
+        let audioUnlocked = false;
+        function unlockAudioGlobal() {
+            if (audioUnlocked) return;
+            audioUnlocked = true;
+
+            try {
+                const AudioContextClass = window.AudioContext || window.webkitAudioContext;
+                if (AudioContextClass) {
+                    const ctx = new AudioContextClass();
+                    if (ctx.state === 'suspended') {
+                        ctx.resume();
+                    }
+                }
+            } catch (e) {}
+
+            [audioRuleta, audioWin].forEach(a => {
+                try {
+                    const p = a.play();
+                    if (p && typeof p.then === 'function') {
+                        p.then(() => {
+                            a.pause();
+                            a.currentTime = 0;
+                        }).catch(() => {});
+                    }
+                } catch (e) {}
+            });
+        }
+
+        ['pointerdown', 'touchstart', 'click'].forEach(evt => {
+            window.addEventListener(evt, unlockAudioGlobal, { once: true });
+        });
+
+        /* ── SALIDA SEGURA Y APAGADO DE CÁMARA ── */
+        function stopCameraAndExit() {
+            console.log('[QuickPlay Face AR] Deteniendo experiencia y apagando cámara web...');
+            try {
+                if (mindarThree) {
+                    mindarThree.stop();
+                }
+            } catch (e) {
+                console.warn('Error al detener MindAR:', e);
+            }
+
+            try {
+                const videos = document.querySelectorAll('video');
+                videos.forEach(v => {
+                    if (v.srcObject && typeof v.srcObject.getTracks === 'function') {
+                        v.srcObject.getTracks().forEach(track => {
+                            track.stop();
+                        });
+                    }
+                    v.srcObject = null;
+                });
+            } catch (e) {
+                console.warn('Error al apagar tracks de video:', e);
+            }
+
+            try {
+                if (player) {
+                    player.stop();
+                    player.dispose();
+                }
+            } catch (e) {}
+
+            window.location.href = 'index.html';
+        }
+
+        if (backBtn) {
+            backBtn.addEventListener('click', (e) => {
+                e.preventDefault();
+                stopCameraAndExit();
+            });
+        }
+
+        /* ── CONTROL DIRECTO DEL GIRO DE LA RULETA ── */
+        let isSpinning = false;
+        let canSpin = true;
+        let spinTimer = null;
+        let currentIndex = 0;
+
+        function startRouletteSpin() {
+            if (isSpinning || !canSpin) return;
+            isSpinning = true;
+            canSpin = false;
+
+            unlockAudioGlobal();
+
+            // a) Ocultar header e inmediatamente mostrar ruleta
+            if (header) header.visible = false;
+            if (ruleta) ruleta.visible = true;
+
+            // Reproducir sonido de ruleta
+            try {
+                audioRuleta.currentTime = 0;
+                audioRuleta.play().catch(() => {});
+            } catch (e) {}
+
+            // b) Alternar texturas cada 70ms
+            const speed = 70;
+            const totalDuration = 3000;
+            let elapsed = 0;
+
+            if (spinTimer) clearInterval(spinTimer);
+
+            spinTimer = setInterval(() => {
+                currentIndex = (currentIndex + 1) % textures.length;
+                if (ruleta && textures[currentIndex]) {
+                    ruleta.material.map = textures[currentIndex];
+                    ruleta.material.needsUpdate = true;
+                }
+                elapsed += speed;
+
+                // c) A los 3000ms frenar ruleta
+                if (elapsed >= totalDuration) {
+                    clearInterval(spinTimer);
+                    spinTimer = null;
+
+                    try {
+                        audioRuleta.pause();
+                        audioRuleta.currentTime = 0;
+                    } catch (e) {}
+
+                    // Textura ganadora al azar
+                    const winnerIndex = Math.floor(Math.random() * textures.length);
+                    if (ruleta && textures[winnerIndex]) {
+                        ruleta.material.map = textures[winnerIndex];
+                        ruleta.material.needsUpdate = true;
+                    }
+
+                    // Reproducir audio de victoria
+                    try {
+                        audioWin.currentTime = 0;
+                        audioWin.play().catch(() => {});
+                    } catch (e) {}
+
+                    isSpinning = false;
+
+                    // d) Tras 4 segundos, permitir volver a jugar
+                    setTimeout(() => {
+                        canSpin = true;
+                    }, 4000);
+                }
+            }, speed);
+        }
+
+        /* ── INICIALIZACIÓN DE LA EXPERIENCIA ── */
+        async function initFaceExperience() {
+            try {
+                // 1. Cargar escena Three.js desde ./app_face.json
+                console.log('[QuickPlay Face AR] Cargando ./app_face.json...');
+                const res = await fetch('./app_face.json');
+                const json = await res.json();
+
+                player = new APP.Player({ alpha: true });
+                await player.load(json);
+
+                // 2. Extraer y preparar objetos Card_Header y Ruleta_Juegos
+                const accesorios = player.scene.getObjectByName('Accesorios');
+                header = player.scene.getObjectByName('Card_Header');
+                ruleta = player.scene.getObjectByName('Ruleta_Juegos');
+
+                // Asegurar escala cuadrada sin distorsión y estados iniciales de visibilidad
+                if (header) {
+                    header.visible = true;
+                    header.scale.set(0.65, 0.65, 0.65);
+                    if (header.material && header.material.map) {
+                        if ('colorSpace' in header.material.map) {
+                            header.material.map.colorSpace = THREE.SRGBColorSpace;
+                        } else {
+                            header.material.map.encoding = THREE.sRGBEncoding;
+                        }
+                        header.material.map.needsUpdate = true;
+                    }
+                }
+                if (ruleta) {
+                    ruleta.visible = false;
+                    ruleta.scale.set(0.65, 0.65, 0.65);
+                    ruleta.material = new THREE.MeshBasicMaterial({
+                        map: textures[0],
+                        color: 0xffffff,
+                        transparent: true
+                    });
+                    ruleta.material.needsUpdate = true;
+                }
+
+                // Asegurar que Accesorios contenga las tarjetas
+                if (accesorios) {
+                    if (header && header.parent !== accesorios) accesorios.add(header);
+                    if (ruleta && ruleta.parent !== accesorios) accesorios.add(ruleta);
+                }
+
+                // 3. Inicializar MindAR Face
+                console.log('[QuickPlay Face AR] Inicializando MindAR Face...');
+                mindarThree = new MindARThree({
+                    container: container,
+                    uiLoading: 'no',
+                    uiScanning: 'no',
+                    uiError: 'yes'
+                });
+
+                const { renderer, scene, camera } = mindarThree;
+
+                // Configurar renderizador
+                renderer.setClearColor(0x000000, 0);
+                if ('outputColorSpace' in renderer) {
+                    renderer.outputColorSpace = THREE.SRGBColorSpace;
+                } else if ('outputEncoding' in renderer) {
+                    renderer.outputEncoding = THREE.sRGBEncoding;
+                }
+
+                // Función responsiva para mantener proporción real sin estirar/deformar
+                function applyResponsiveAspect() {
+                    const width = window.innerWidth;
+                    const height = window.innerHeight;
+                    renderer.setSize(width, height);
+                    camera.aspect = width / height;
+                    camera.updateProjectionMatrix();
+                }
+
+                applyResponsiveAspect();
+                window.addEventListener('resize', applyResponsiveAspect);
+
+                // Ancla en la parte superior / frente del rostro
+                const anchor = mindarThree.addAnchor(10);
+                const faceMesh = mindarThree.addFaceMesh();
+                faceMesh.visible = false;
+
+                if (accesorios) {
+                    anchor.group.add(accesorios);
+                }
+
+                // Transferir luces de la escena
+                const lights = [];
+                player.scene.traverse((obj) => {
+                    if (obj.isLight) lights.push(obj);
+                });
+                lights.forEach(l => scene.add(l));
+                if (lights.length === 0) {
+                    scene.add(new THREE.AmbientLight(0xffffff, 1.2));
+                    const dl = new THREE.DirectionalLight(0xffffff, 0.8);
+                    dl.position.set(0, 1, 1);
+                    scene.add(dl);
+                }
+
+                // 4. Iniciar motor MindAR Face
+                await mindarThree.start();
+                loader.style.display = 'none';
+                hint.style.display = 'block';
+
+                // Reaplicar ajuste de dimensiones una vez arrancada la cámara
+                applyResponsiveAspect();
+
+                // Permitir girar al tocar la pantalla
+                window.addEventListener('pointerdown', (e) => {
+                    if (e.target.closest('#btn-back-ruleta')) return;
+                    startRouletteSpin();
+                });
+
+                /* ── BUCLE DE RENDER Y DETECCIÓN FACIAL (MOUTH OPEN) ── */
+                let isMouthOpen = false;
+                let prevTime = performance.now();
+
+                renderer.setAnimationLoop(() => {
+                    const now = performance.now();
+                    const delta = now - prevTime;
+                    prevTime = now;
+
+                    // Mantener la cámara de Three.js alineada a la ventana
+                    if (camera.aspect !== window.innerWidth / window.innerHeight) {
+                        applyResponsiveAspect();
+                    }
+
+                    // Actualizar scripts internos si aplica
+                    if (player.events && player.events.update) {
+                        player.dispatch(player.events.update, { time: now, delta: delta });
+                    }
+
+                    // Renderizar escena facial
+                    renderer.render(scene, camera);
+
+                    // Detección de apertura de boca por landmarks (puntos 13 y 14)
+                    if (faceMesh && faceMesh.geometry && faceMesh.geometry.attributes.position && anchor.group.visible) {
+                        const positions = faceMesh.geometry.attributes.position;
+                        const yUpperLip = positions.getY(13);
+                        const yLowerLip = positions.getY(14);
+                        const mouthDist = Math.abs(yLowerLip - yUpperLip);
+
+                        // Normalización respecto a la distancia ocular (puntos 33 y 263)
+                        const eyeDist = Math.hypot(
+                            positions.getX(263) - positions.getX(33),
+                            positions.getY(263) - positions.getY(33)
+                        ) || 1.0;
+
+                        const mouthRatio = mouthDist / eyeDist;
+
+                        if (!isMouthOpen && mouthRatio > 0.11) {
+                            isMouthOpen = true;
+                            startRouletteSpin();
+                        } else if (isMouthOpen && mouthRatio < 0.07) {
+                            isMouthOpen = false;
+                        }
+                    }
+                });
+
+                console.log('[QuickPlay Face AR] Ruleta facial lista y sincronizada');
+
+            } catch (err) {
+                console.error('[QuickPlay Face AR] Error al inicializar:', err);
+                loader.innerHTML = `<p style="color:#ff5555; font-weight:700;">Error al iniciar cámara: ${err.message}</p>`;
+            }
+        }
+
+        if (document.readyState === 'loading') {
+            document.addEventListener('DOMContentLoaded', initFaceExperience);
+        } else {
+            initFaceExperience();
+        }
+    </script>
+
+</body>
+
+</html>

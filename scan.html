@@ -1,0 +1,278 @@
+<!DOCTYPE html>
+<html lang="es">
+
+<head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover" />
+    <title>QuickPlay AR — Escaneo de Cartas</title>
+    <meta name="description"
+        content="QuickPlay AR: escaneá la portada de tu juego y descubrí sinopsis, duración y calificación en realidad aumentada." />
+    <meta name="theme-color" content="#070709" />
+    <link rel="icon" type="image/png" href="assets/ui/logo.png" />
+    <link rel="stylesheet" href="css/app.css" />
+    <script type="importmap">
+    {
+        "imports": {
+            "three": "https://cdn.jsdelivr.net/npm/three@0.160.0/build/three.module.js",
+            "three/addons/": "https://cdn.jsdelivr.net/npm/three@0.160.0/examples/jsm/",
+            "mindar-image-three": "https://cdn.jsdelivr.net/npm/mind-ar@1.2.5/dist/mindar-image-three.prod.js"
+        }
+    }
+    </script>
+</head>
+
+<body>
+
+    <!-- BOTÓN FLOTANTE VOLVER (LIQUID GLASS) -->
+    <a href="index.html" class="btn-back" id="btn-back-scan" aria-label="Volver al menú principal">⬅ VOLVER</a>
+
+    <!-- CONTENEDOR AR -->
+    <div id="ar-container"></div>
+
+    <!-- THREE.JS PLAYER WRAPPER -->
+    <div id="player-wrapper"></div>
+
+    <!-- HUD BARRA INFERIOR -->
+    <nav id="hud-bottom-bar" role="navigation" aria-label="Vistas de información AR">
+        <button id="btn-sinopsis" class="hud-btn active" type="button" title="Sinopsis" aria-label="Ver Sinopsis"
+            onclick="cambiarVista('Card_Sinopsis')">
+            <img src="assets/ui/lupa.svg" alt="Sinopsis" />
+        </button>
+        <button id="btn-duracion" class="hud-btn" type="button" title="Duración" aria-label="Ver Duración"
+            onclick="cambiarVista('Card_Duracion')">
+            <img src="assets/ui/reloj.svg" alt="Duración" />
+        </button>
+        <button id="btn-calificacion" class="hud-btn" type="button" title="Calificación" aria-label="Ver Calificación"
+            onclick="cambiarVista('Card_Calificacion')">
+            <img src="assets/ui/estrella.svg" alt="Calificación" />
+        </button>
+    </nav>
+
+    <!-- DEBUG LOG -->
+    <div id="log" aria-live="polite"></div>
+
+    <!-- Lógica principal como ES Module -->
+    <script type="module">
+        import * as THREE from 'three';
+        window.THREE = THREE;
+
+        import { APP } from './js/app.js';
+        import { MindARController } from './js/mindar/mindar_controller.js';
+
+        /* ── Log ── */
+        const logEl = document.getElementById('log');
+        function log(msg) {
+            console.log('[QuickPlay AR]', msg);
+            if (logEl) {
+                const line = document.createElement('div');
+                line.textContent = msg;
+                logEl.appendChild(line);
+                logEl.scrollTop = logEl.scrollHeight;
+            }
+        }
+
+        /* ── DOM refs ── */
+        const hudBar = document.getElementById('hud-bottom-bar');
+        const arContainer = document.getElementById('ar-container');
+        const playerWrapper = document.getElementById('player-wrapper');
+
+        /* ── Audios ── */
+        const AUDIO_SOURCES = ['assets/audio/scan.mp3', 'assets/audio/transition.mp3'];
+        const audioCache = {};
+
+        function preloadAudios() {
+            for (const src of AUDIO_SOURCES) {
+                const a = new Audio(src);
+                a.load();
+                audioCache[src] = a;
+                log('Audio precargado: ' + src);
+            }
+        }
+
+        function playAudio(src) {
+            const a = audioCache[src];
+            if (!a) return;
+            a.currentTime = 0;
+            a.play().catch(() => { });
+        }
+
+        /* ── APP.Player ── */
+        let player = null;
+
+        async function initPlayer() {
+            player = new APP.Player({ alpha: true });
+            playerWrapper.appendChild(player.dom);
+            player.dom.style.display = 'none';
+
+            log('Cargando escena 3D…');
+            const res = await fetch('app.json');
+            log('Parseando escena…');
+            const json = await res.json();
+            log('Inicializando renderer…');
+            await player.load(json);
+
+            player.setSize(window.innerWidth, window.innerHeight);
+            window.addEventListener('resize', () => {
+                player.setSize(window.innerWidth, window.innerHeight);
+            });
+
+            applySceneVisibility('Card_Sinopsis');
+            player.play();
+            player.dom.style.display = 'none';
+            log('APP.Player cargado correctamente');
+        }
+
+        /* ── MindARController ── */
+        let mindARCtrl = null;
+
+        async function initMindAR() {
+            mindARCtrl = new MindARController(arContainer, player);
+
+            mindARCtrl.addListener('start', () => {
+                log('MindAR iniciado');
+                playAudio('assets/audio/scan.mp3');
+
+                const canvasAR = arContainer.querySelector('canvas');
+                if (canvasAR) {
+                    canvasAR.addEventListener('pointerdown', (e) => {
+                        if (player && player.events && player.events.pointerdown) {
+                            player.events.pointerdown.forEach(fn => fn(e));
+                        }
+                    });
+                }
+            });
+
+            mindARCtrl.addListener('found', (target) => {
+                log('Target encontrado: ' + (target && target.name ? target.name : '?'));
+                playAudio('assets/audio/scan.mp3');
+                if (target?.content) {
+                    currentActiveGroup = target.content;
+                }
+                applySceneVisibility(currentView);
+            });
+
+            mindARCtrl.addListener('lost', (target) => {
+                log('Target perdido: ' + (target && target.name ? target.name : '?'));
+            });
+
+            await mindARCtrl.start();
+            log('MindARController arrancado');
+        }
+
+        /* ── cambiarVista ── */
+        const CARD_MAP = {
+            Card_Sinopsis: 'btn-sinopsis',
+            Card_Duracion: 'btn-duracion',
+            Card_Calificacion: 'btn-calificacion',
+        };
+
+        const TARGET_GROUPS = [
+            'TARGET_CUPHEAD',
+            'TARGET_GTA',
+            'TARGET_FIFA',
+            'TARGET_TLOU'
+        ];
+
+        let currentActiveGroup = null;
+        let currentView = 'Card_Sinopsis';
+
+        function getActiveGameGroup() {
+            const scene = mindARCtrl?.mindar?.scene || player?.scene;
+            if (!scene) return null;
+
+            for (const name of TARGET_GROUPS) {
+                const group = scene.getObjectByName(name);
+                if (group && group.visible && (!group.parent || group.parent.visible !== false)) {
+                    return group;
+                }
+            }
+            return null;
+        }
+
+        function applySceneVisibility(nombreVista) {
+            if (nombreVista) {
+                currentView = nombreVista;
+            }
+
+            // 1. Detectar cuál grupo de juego está actualmente en pantalla
+            let activeGroup = getActiveGameGroup();
+            if (activeGroup) {
+                currentActiveGroup = activeGroup;
+            } else if (currentActiveGroup) {
+                activeGroup = currentActiveGroup;
+            }
+
+            const applyToGroup = (group) => {
+                if (!group) return;
+                group.traverse((obj) => {
+                    if (obj === group) return;
+
+                    // 2. Al pulsar los botones del menú, alterna únicamente entre Card_Sinopsis, Card_Duracion y Card_Calificacion
+                    if (obj.name === 'Card_Sinopsis' || obj.name === 'Card_Duracion' || obj.name === 'Card_Calificacion') {
+                        obj.visible = (obj.name === currentView);
+                    }
+                    // 3. Asegura que el objeto logo se mantenga siempre con visible = true
+                    else if (obj.name === 'logo') {
+                        obj.visible = true;
+                    }
+                });
+            };
+
+            if (activeGroup) {
+                // Alterna únicamente las tarjetas del juego activo en pantalla
+                applyToGroup(activeGroup);
+            } else {
+                // Si aún no hay grupo activo detectado (p. ej. en la carga inicial), preconfigurar todos los grupos
+                const scene = mindARCtrl?.mindar?.scene || player?.scene;
+                if (scene) {
+                    TARGET_GROUPS.forEach((name) => {
+                        const group = scene.getObjectByName(name);
+                        applyToGroup(group);
+                    });
+                }
+            }
+        }
+
+        window.cambiarVista = function (nombreVista) {
+            Object.values(CARD_MAP).forEach(btnId => {
+                const btn = document.getElementById(btnId);
+                if (btn) btn.classList.remove('active');
+            });
+            const activeBtnId = CARD_MAP[nombreVista];
+            if (activeBtnId) {
+                const activeBtn = document.getElementById(activeBtnId);
+                if (activeBtn) activeBtn.classList.add('active');
+            }
+            applySceneVisibility(nombreVista);
+            playAudio('assets/audio/transition.mp3');
+            log('Vista activa: ' + nombreVista);
+        };
+
+        /* ── Arranque Automático ── */
+        async function startAR() {
+            preloadAudios();
+            try {
+                log('Iniciando escena 3D…');
+                await initPlayer();
+                log('Iniciando cámara AR…');
+                await initMindAR();
+                log('Experiencia AR activa');
+            } catch (err) {
+                console.error('[QuickPlay AR] Error al inicializar AR:', err);
+                log('Error: ' + err.message);
+            }
+        }
+
+        if (document.readyState === 'loading') {
+            document.addEventListener('DOMContentLoaded', startAR);
+        } else {
+            startAR();
+        }
+
+        /* ── Debug global ── */
+        window.__qpar = { getPlayer: () => player, getMindAR: () => mindARCtrl };
+    </script>
+
+</body>
+
+</html>
